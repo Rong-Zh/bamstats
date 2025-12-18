@@ -2,7 +2,8 @@
 
 # Compiler and flags
 CXX = g++
-CXXFLAGS = -Wall -O2 -std=c++17
+# Aggressive optimization: -O3 enables auto-vectorization, -march=native for CPU-specific optimizations
+CXXFLAGS = -Wall -O3 -std=c++17 -march=native -mtune=native
 
 ifdef DEBUG
   CXXFLAGS += -DDEBUG=true -g

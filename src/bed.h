@@ -6,6 +6,32 @@
 #include <unordered_map>
 #include <cstdint>
 
+inline void split(const std::string &str, char delimiter, std::vector<std::string> &result)
+{
+    if (str.empty())
+        return;
+    const char *data = str.data();
+    const char *start = data;
+    const char *end = data + str.size();
+
+    for (const char *p = data; p < end; ++p)
+    {
+        if (*p == delimiter)
+        {
+            if (p > start)
+            {
+                result.emplace_back(start, p - start);
+            }
+            start = p + 1;
+        }
+    }
+    if (start < end)
+    {
+        result.emplace_back(start, end - start);
+    }
+    return;
+}
+
 struct Interval
 {
     uint64_t start;
@@ -22,7 +48,7 @@ struct Interval
     {
         return start < other.end && other.start < end;
     }
-    
+
     // Check if a position range overlaps with this interval
     bool overlaps(uint64_t pos_start, uint64_t pos_end) const
     {
@@ -34,21 +60,26 @@ class Bed
 {
 public:
     Bed(const std::string &bed_file, bool sorted = false);
+    // Construct a Bed directly from intervals (no file I/O)
+    Bed(std::unordered_map<std::string, std::vector<Interval>> intervals, bool sorted = false);
+
     ~Bed();
-    
+
     void sort(size_t max_threads = 4);
     std::unordered_map<std::string, std::vector<Interval>> merge(size_t max_threads = 4);
     uint64_t get_length() const;
-    
+
     // Check if a read position overlaps with any BED interval on the given chromosome
-    bool is_ontarget(const char* chrom, uint64_t read_start, uint64_t read_end) const;
-    
+    bool is_ontarget(const char *chrom, uint64_t read_start, uint64_t read_end) const;
+
     // Get the intervals map (const reference)
-    const std::unordered_map<std::string, std::vector<Interval>>& get_intervals() const {
+    const std::unordered_map<std::string, std::vector<Interval>> &get_intervals() const
+    {
         return intervals_;
     }
-    
-    bool is_empty() const {
+
+    bool is_empty() const
+    {
         return intervals_.empty();
     }
 
