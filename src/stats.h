@@ -76,14 +76,30 @@ inline bool file_exists(const std::string &filename)
 
 inline std::unique_ptr<Bed> parse_region(const std::string &target_spec, bam_hdr_t *header)
 {
-    if (target_spec.empty())
+    if (!header)
         return nullptr;
+    
+    // If target_spec is empty, use all chromosomes from BAM header
+    if (target_spec.empty())
+    {
+        std::unordered_map<std::string, std::vector<Interval>> intervals;
+        for (int i = 0; i < header->n_targets; i++)
+        {
+            std::string chrom = header->target_name[i];
+            uint64_t len = static_cast<uint64_t>(header->target_len[i]);
+            if (len > 0)
+            {
+                intervals[chrom].push_back(Interval{0, len});
+            }
+        }
+        return std::make_unique<Bed>(std::move(intervals), false);
+    }
+    
+    // Check if it's a BED file
     if (file_exists(target_spec)) 
         return std::make_unique<Bed>(target_spec, false);
     
-        // It's a region string - parse it
-    if (!header)
-        return nullptr;
+    // It's a region string - parse it
     std::unordered_map<std::string, std::vector<Interval>> intervals;
     std::vector<std::string> parts;
     parts.reserve(16);
