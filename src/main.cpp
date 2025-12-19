@@ -20,7 +20,7 @@ int main(int argc, char *argv[])
     parser.add_optional<int>('t', "thread", "Number of threads", 1);
     parser.add_optional<int>('q', "mapping-quality", "Mapping quality cutoff for unique mapping", 20);
     parser.add_optional<std::string>('L', "target", "Target regions: BED file path OR region string ");
-    parser.add_optional<std::string>('d', "depth-thresholds", "Comma-separated depth thresholds for coverage calculation", "1,10,20,30,50,100,500,1000,3000");
+    parser.add_optional<std::string>('d', "depth-thresholds", "Comma-separated depth thresholds for coverage calculation", "1,20,30,50,100,500,1000,3000");
     parser.add_help();
 
     parser.parse_args(argc, argv);
