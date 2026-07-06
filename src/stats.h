@@ -480,113 +480,130 @@ inline DepthStats calculate_region_depth(
     DepthStats stats;
 
     int tid = bam_name2id(header, chrom.c_str());
-    if (tid < 0)
+    if (tid < 0 || start >= end)
         return stats;
 
-    int64_t region_len = end - start;
-    std::vector<uint32_t> depth_array(region_len * 3, 0);
-
-    hts_itr_t *iter = sam_itr_queryi(idx, tid, start, end);
-    if (!iter)
+    int64_t target_len = static_cast<int64_t>(header->target_len[tid]);
+    if (start < 0)
+        start = 0;
+    if (end > target_len)
+        end = target_len;
+    if (start >= end)
         return stats;
 
+    constexpr int64_t MAX_CHUNK_SIZE = 1000000; // 1 million bases per chunk to reduce peak memory
     bam1_t *b = bam_init1();
 
-    while (sam_itr_next(in, iter, b) >= 0)
+    for (int64_t chunk_start = start; chunk_start < end; chunk_start += MAX_CHUNK_SIZE)
     {
-        if (b->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FSUPPLEMENTARY))
+        int64_t chunk_end = std::min(chunk_start + MAX_CHUNK_SIZE, end);
+        int64_t chunk_len = chunk_end - chunk_start;
+        if (chunk_len <= 0)
             continue;
 
-        bool is_qcfail = (b->core.flag & BAM_FQCFAIL);
-        bool is_duplicate = (!is_qcfail) && (b->core.flag & BAM_FDUP);
-        bool pass_mapq = (b->core.qual >= mapq_cut);
-
-        uint32_t *cigar = bam_get_cigar(b);
-        int n_cigar = b->core.n_cigar;
-        int64_t ref_pos = b->core.pos;
-
-        for (int i = 0; i < n_cigar; i++)
+        std::vector<uint32_t> depth_array;
+        try
         {
-            int op = bam_cigar_op(cigar[i]);
-            int len = bam_cigar_oplen(cigar[i]);
+            depth_array.resize(chunk_len * 3);
+        }
+        catch (const std::bad_alloc &e)
+        {
+            std::cerr << "Error: failed to allocate depth array for region " << chrom << ":" << chunk_start << "-" << chunk_end << " (" << e.what() << ")\n";
+            break;
+        }
 
-            if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF)
+        hts_itr_t *iter = sam_itr_queryi(idx, tid, chunk_start, chunk_end);
+        if (!iter)
+            continue;
+
+        while (sam_itr_next(in, iter, b) >= 0)
+        {
+            if (b->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FSUPPLEMENTARY))
+                continue;
+
+            bool is_qcfail = (b->core.flag & BAM_FQCFAIL);
+            bool is_duplicate = (!is_qcfail) && (b->core.flag & BAM_FDUP);
+            bool pass_mapq = (b->core.qual >= mapq_cut);
+
+            uint32_t *cigar = bam_get_cigar(b);
+            int n_cigar = b->core.n_cigar;
+            int64_t ref_pos = b->core.pos;
+
+            for (int i = 0; i < n_cigar; i++)
             {
-                int64_t seg_start = std::max(ref_pos, start);
-                int64_t seg_end = std::min(ref_pos + len, end);
+                int op = bam_cigar_op(cigar[i]);
+                int len = bam_cigar_oplen(cigar[i]);
 
-                if (seg_start < seg_end)
+                if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF)
                 {
-                    for (int64_t pos = seg_start; pos < seg_end; pos++)
+                    int64_t seg_start = std::max(ref_pos, chunk_start);
+                    int64_t seg_end = std::min(ref_pos + len, chunk_end);
+
+                    if (seg_start < seg_end)
                     {
-                        int64_t offset = pos - start;
-                        if (offset >= 0 && offset < region_len)
+                        for (int64_t pos = seg_start; pos < seg_end; pos++)
                         {
+                            int64_t offset = pos - chunk_start;
                             depth_array[offset * 3 + 0]++;
                             if (!is_duplicate && pass_mapq)
                                 depth_array[offset * 3 + 1]++;
                             depth_array[offset * 3 + 2]++;
                         }
                     }
+                    ref_pos += len;
                 }
-                ref_pos += len;
-            }
-            else if (op == BAM_CDEL)
-            {
-                int64_t seg_start = std::max(ref_pos, start);
-                int64_t seg_end = std::min(ref_pos + len, end);
-
-                if (seg_start < seg_end)
+                else if (op == BAM_CDEL)
                 {
-                    for (int64_t pos = seg_start; pos < seg_end; pos++)
+                    int64_t seg_start = std::max(ref_pos, chunk_start);
+                    int64_t seg_end = std::min(ref_pos + len, chunk_end);
+
+                    if (seg_start < seg_end)
                     {
-                        int64_t offset = pos - start;
-                        if (offset >= 0 && offset < region_len)
+                        for (int64_t pos = seg_start; pos < seg_end; pos++)
                         {
+                            int64_t offset = pos - chunk_start;
                             depth_array[offset * 3 + 2]++;
                         }
                     }
+                    ref_pos += len;
                 }
-                ref_pos += len;
+                else if (bam_cigar_type(op) & 2)
+                {
+                    ref_pos += len;
+                }
             }
-            else if (bam_cigar_type(op) & 2)
+        }
+        hts_itr_destroy(iter);
+
+        stats.total_bases += chunk_len;
+        for (int64_t i = 0; i < chunk_len; i++)
+        {
+            uint32_t rawdepth = depth_array[i * 3 + 0];
+            uint32_t rmdupdepth = depth_array[i * 3 + 1];
+            uint32_t covdepth = depth_array[i * 3 + 2];
+
+            if (covdepth > 0)
             {
-                ref_pos += len;
+                stats.covered_bases++;
             }
+
+            stats.total_rawdepth += rawdepth;
+            stats.total_rmdupdepth += rmdupdepth;
+            stats.total_covdepth += covdepth;
+            stats.depth_histogram[covdepth]++;
         }
     }
 
     bam_destroy1(b);
-    hts_itr_destroy(iter);
-
-    stats.total_bases = region_len;
-
-    for (int64_t i = 0; i < region_len; i++)
-    {
-        uint32_t rawdepth = depth_array[i * 3 + 0];
-        uint32_t rmdupdepth = depth_array[i * 3 + 1];
-        uint32_t covdepth = depth_array[i * 3 + 2];
-
-        if (covdepth > 0)
-        {
-            stats.covered_bases++;
-        }
-
-        stats.total_rawdepth += rawdepth;
-        stats.total_rmdupdepth += rmdupdepth;
-        stats.total_covdepth += covdepth;
-        stats.depth_histogram[covdepth]++;
-    }
-
     return stats;
 }
 
 inline void depth_worker_thread(
     const std::string &bam_path,
-    const std::vector<std::tuple<std::string, int64_t, int64_t>> &regions,
+    const std::vector<std::tuple<const std::string *, int64_t, int64_t>> &regions,
     int mapq_cut,
     int thread_id,
-    ProducerConsumerQueue<DepthStats> &result_queue)
+    DepthStats &result)
 {
     samFile *in = sam_open(bam_path.c_str(), "r");
     if (!in)
@@ -612,22 +629,14 @@ inline void depth_worker_thread(
     }
 
     DepthStats local_stats;
-    for (const auto &[chrom, start, end] : regions)
+    for (const auto &[chrom_ptr, start, end] : regions)
     {
         DepthStats region_stats = calculate_region_depth(
-            in, header, idx, chrom, start, end, mapq_cut);
+            in, header, idx, *chrom_ptr, start, end, mapq_cut);
         local_stats.merge(region_stats);
     }
 
-    bool sent = false;
-    while (!sent)
-    {
-        sent = result_queue.write(local_stats);
-        if (!sent)
-        {
-            std::this_thread::yield();
-        }
-    }
+    result = std::move(local_stats);
 
     hts_idx_destroy(idx);
     bam_hdr_destroy(header);
@@ -655,14 +664,16 @@ inline DepthStats calculate_depth_stats(
         total_regions += interval_list.size();
     }
 
-    std::vector<std::tuple<std::string, int64_t, int64_t>> all_regions;
+    std::cout << "BED interval count: " << total_regions << "\n";
+
+    std::vector<std::tuple<const std::string *, int64_t, int64_t>> all_regions;
     all_regions.reserve(total_regions);
 
     for (const auto &[chrom, interval_list] : intervals)
     {
         for (const auto &interval : interval_list)
         {
-            all_regions.emplace_back(chrom, interval.start, interval.end);
+            all_regions.emplace_back(&chrom, interval.start, interval.end);
         }
     }
 
@@ -679,7 +690,7 @@ inline DepthStats calculate_depth_stats(
                   return len_a > len_b;
               });
 
-    std::vector<std::vector<std::tuple<std::string, int64_t, int64_t>>> thread_regions(n_threads);
+    std::vector<std::vector<std::tuple<const std::string *, int64_t, int64_t>>> thread_regions(n_threads);
     std::vector<int64_t> thread_load(n_threads, 0);
 
     for (const auto &region : all_regions)
@@ -690,7 +701,7 @@ inline DepthStats calculate_depth_stats(
         thread_load[min_thread] += region_size;
     }
 
-    ProducerConsumerQueue<DepthStats> result_queue(8192);
+    std::vector<DepthStats> thread_results(n_threads);
 
     std::vector<std::thread> workers;
     for (int i = 0; i < n_threads; i++)
@@ -703,7 +714,7 @@ inline DepthStats calculate_depth_stats(
                 std::cref(thread_regions[i]),
                 mapq_cut,
                 i,
-                std::ref(result_queue));
+                std::ref(thread_results[i]));
         }
     }
 
@@ -712,10 +723,9 @@ inline DepthStats calculate_depth_stats(
         thread.join();
     }
 
-    DepthStats thread_stats;
-    while (result_queue.read(thread_stats))
+    for (int i = 0; i < n_threads; ++i)
     {
-        final_stats.merge(thread_stats);
+        final_stats.merge(thread_results[i]);
     }
 
     return final_stats;
@@ -747,7 +757,7 @@ inline std::vector<uint32_t> parse_depth_thresholds(const std::string &str)
 inline void region_worker_thread(
     const RegionTask &task,
     int thread_id,
-    ProducerConsumerQueue<ThreadStats> &result_queue)
+    ThreadStats &result)
 {
     samFile *in = sam_open(task.bam_path.c_str(), "r");
     if (in == NULL)
@@ -807,15 +817,7 @@ inline void region_worker_thread(
         }
     }
 
-    bool sent = false;
-    while (!sent)
-    {
-        sent = result_queue.write(local_stats);
-        if (!sent)
-        {
-            std::this_thread::yield();
-        }
-    }
+    result = std::move(local_stats);
 
     bam_destroy1(b);
     hts_idx_destroy(idx);

@@ -13,7 +13,7 @@ int main(int argc, char *argv[])
     // Create argument parser
     ArgumentParser parser("BAM file statistics tool");
     parser.set_program_name("bamstats");
-    parser.set_version("1.1.0");
+    parser.set_version("1.1.8");
     // Add arguments
     parser.add_required<File>('b', "bam", "Input BAM file path");
     parser.add_required<File>('s', "stats", "Output statistics file path");
@@ -62,23 +62,23 @@ int main(int argc, char *argv[])
     }
     hts_idx_destroy(idx);
 
-    // Load target regions (BED file or region string)
-    std::unique_ptr<Bed> bed_regions;
+    // Load target regions (BED file or region string) or whole genome when no target specified
+    std::unique_ptr<Bed> bed_regions = parse_region(target_spec, header);
     bool is_region_string = false;
-    if (!target_spec.empty())
+    if (!bed_regions || bed_regions->is_empty())
     {
-        bed_regions = parse_region(target_spec, header);
-        if (!bed_regions || bed_regions->is_empty())
-        {
-            std::cerr << "Error: Failed to parse target specification or no valid regions" << std::endl;
-            bam_hdr_destroy(header);
-            sam_close(in);
-            return 1;
-        }
-        // Sort and merge overlapping intervals
-        bed_regions->sort(n_threads);
-        bed_regions->merge(n_threads);
-        std::cout << "Target regions length: " << bed_regions->get_length() << " bp\n";
+        std::cerr << "Error: Failed to parse target specification or no valid regions" << std::endl;
+        bam_hdr_destroy(header);
+        sam_close(in);
+        return 1;
+    }
+    // Sort and merge overlapping intervals
+    bed_regions->sort(n_threads);
+    bed_regions->merge(n_threads);
+    std::cout << "Target regions length: " << bed_regions->get_length() << " bp\n";
+    if (!target_spec.empty() && !file_exists(target_spec))
+    {
+        is_region_string = true;
     }
 
     std::cout << "BAM Statistics Tool\n";
@@ -124,10 +124,8 @@ int main(int argc, char *argv[])
     bam_hdr_destroy(header);
     sam_close(in);
 
-    // Create result queue for threads to send back results
-    // Larger queue reduces thread blocking
-    constexpr uint32_t QUEUE_SIZE = 8192;
-    ProducerConsumerQueue<ThreadStats> result_queue(QUEUE_SIZE);
+    // Create result slots for each worker thread
+    std::vector<ThreadStats> thread_results(n_threads);
     // Create tasks for each thread
     std::vector<RegionTask> tasks(n_threads);
     for (int i = 0; i < n_threads; ++i)
@@ -151,7 +149,7 @@ int main(int argc, char *argv[])
             region_worker_thread,
             std::cref(tasks[i]),
             i,
-            std::ref(result_queue));
+            std::ref(thread_results[i]));
     }
     // Wait for all worker threads to complete
     for (auto &thread : worker_threads)
@@ -160,17 +158,12 @@ int main(int argc, char *argv[])
     }
 
     std::cout << "All threads completed. Collecting results...\n";
-    // Collect results from result queue
     BamStats global_stats;
-    ThreadStats thread_stats;
-    int results_collected = 0;
-    while (result_queue.read(thread_stats))
+    for (int i = 0; i < n_threads; ++i)
     {
-        global_stats.merge(thread_stats);
-        results_collected++;
+        global_stats.merge(thread_results[i]);
     }
-
-    std::cout << "Collected results from " << results_collected << " threads.\n";
+    std::cout << "Collected results from " << worker_threads.size() << " threads.\n";
     std::cout << "Processing complete!\n";
 
     // Calculate depth statistics if BED file is provided
