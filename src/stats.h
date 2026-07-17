@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <exception>
 #include <functional>
 #include <iomanip>
 #include <iostream>
@@ -193,6 +194,8 @@ inline void get_alignment_span(bam1_t *b, int32_t &aln_start, int32_t &aln_end)
 // Follows bamdst's three-depth model
 struct DepthStats
 {
+    bool success = true;
+    std::string error_message;
     uint64_t total_bases = 0;                               // Total bases in BED regions
     uint64_t covered_bases = 0;                             // Bases with covdepth > 0
     uint64_t total_rawdepth = 0;                            // Sum of raw depths (with duplicates)
@@ -260,6 +263,14 @@ struct DepthStats
 
     void merge(const DepthStats &other)
     {
+        if (!other.success)
+        {
+            success = false;
+            if (error_message.empty())
+                error_message = other.error_message;
+            return;
+        }
+
         total_bases += other.total_bases;
         covered_bases += other.covered_bases;
         total_rawdepth += other.total_rawdepth;
@@ -493,30 +504,48 @@ inline DepthStats calculate_region_depth(
 
     constexpr int64_t MAX_CHUNK_SIZE = 1000000; // 1 million bases per chunk to reduce peak memory
     bam1_t *b = bam_init1();
-
-    for (int64_t chunk_start = start; chunk_start < end; chunk_start += MAX_CHUNK_SIZE)
+    if (!b)
     {
-        int64_t chunk_end = std::min(chunk_start + MAX_CHUNK_SIZE, end);
-        int64_t chunk_len = chunk_end - chunk_start;
-        if (chunk_len <= 0)
-            continue;
+        stats.success = false;
+        stats.error_message = "failed to allocate BAM record for region " + chrom;
+        return stats;
+    }
+
+    for (int64_t chunk_start = start; chunk_start < end;)
+    {
+        // All coordinates are 0-based, half-open. Computing the length from
+        // the remaining interval makes exact 1M boundaries unambiguous and
+        // avoids overflowing chunk_start + MAX_CHUNK_SIZE.
+        const int64_t chunk_len = std::min(MAX_CHUNK_SIZE, end - chunk_start);
+        const int64_t chunk_end = chunk_start + chunk_len;
 
         std::vector<uint32_t> depth_array;
         try
         {
-            depth_array.resize(chunk_len * 3);
+            depth_array.resize(static_cast<size_t>(chunk_len) * 3);
         }
-        catch (const std::bad_alloc &e)
+        catch (const std::exception &e)
         {
-            std::cerr << "Error: failed to allocate depth array for region " << chrom << ":" << chunk_start << "-" << chunk_end << " (" << e.what() << ")\n";
-            break;
+            stats.success = false;
+            stats.error_message = "failed to allocate depth array for region " + chrom + ":" +
+                                  std::to_string(chunk_start) + "-" + std::to_string(chunk_end) +
+                                  " (" + e.what() + ")";
+            bam_destroy1(b);
+            return stats;
         }
 
         hts_itr_t *iter = sam_itr_queryi(idx, tid, chunk_start, chunk_end);
         if (!iter)
-            continue;
+        {
+            stats.success = false;
+            stats.error_message = "failed to create BAM iterator for region " + chrom + ":" +
+                                  std::to_string(chunk_start) + "-" + std::to_string(chunk_end);
+            bam_destroy1(b);
+            return stats;
+        }
 
-        while (sam_itr_next(in, iter, b) >= 0)
+        int read_status = 0;
+        while ((read_status = sam_itr_next(in, iter, b)) >= 0)
         {
             if (b->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FSUPPLEMENTARY))
                 continue;
@@ -575,6 +604,15 @@ inline DepthStats calculate_region_depth(
         }
         hts_itr_destroy(iter);
 
+        if (read_status < -1)
+        {
+            stats.success = false;
+            stats.error_message = "failed while reading BAM region " + chrom + ":" +
+                                  std::to_string(chunk_start) + "-" + std::to_string(chunk_end);
+            bam_destroy1(b);
+            return stats;
+        }
+
         stats.total_bases += chunk_len;
         for (int64_t i = 0; i < chunk_len; i++)
         {
@@ -592,6 +630,8 @@ inline DepthStats calculate_region_depth(
             stats.total_covdepth += covdepth;
             stats.depth_histogram[covdepth]++;
         }
+
+        chunk_start = chunk_end;
     }
 
     bam_destroy1(b);
@@ -608,7 +648,9 @@ inline void depth_worker_thread(
     samFile *in = sam_open(bam_path.c_str(), "r");
     if (!in)
     {
-        std::cerr << "Thread " << thread_id << ": Failed to open BAM file for depth calculation\n";
+        result.success = false;
+        result.error_message = "thread " + std::to_string(thread_id) +
+                               ": failed to open BAM file for depth calculation";
         return;
     }
 
@@ -616,6 +658,9 @@ inline void depth_worker_thread(
     bam_hdr_t *header = sam_hdr_read(in);
     if (!header)
     {
+        result.success = false;
+        result.error_message = "thread " + std::to_string(thread_id) +
+                               ": failed to read BAM header for depth calculation";
         sam_close(in);
         return;
     }
@@ -623,6 +668,9 @@ inline void depth_worker_thread(
     hts_idx_t *idx = sam_index_load(in, bam_path.c_str());
     if (!idx)
     {
+        result.success = false;
+        result.error_message = "thread " + std::to_string(thread_id) +
+                               ": failed to load BAM index for depth calculation";
         bam_hdr_destroy(header);
         sam_close(in);
         return;
@@ -633,6 +681,12 @@ inline void depth_worker_thread(
     {
         DepthStats region_stats = calculate_region_depth(
             in, header, idx, *chrom_ptr, start, end, mapq_cut);
+        if (!region_stats.success)
+        {
+            local_stats.success = false;
+            local_stats.error_message = std::move(region_stats.error_message);
+            break;
+        }
         local_stats.merge(region_stats);
     }
 

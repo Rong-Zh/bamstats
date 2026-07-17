@@ -22,8 +22,33 @@ int main(int argc, char *argv[])
     parser.add_optional<std::string>('L', "target", "Target regions: BED file path OR region string ");
     parser.add_optional<std::string>('d', "depth-thresholds", "Comma-separated depth thresholds for coverage calculation", "1,20,30,50,100,500,1000,3000");
     parser.add_help();
+    parser.add_version();
 
-    parser.parse_args(argc, argv);
+    bool informational_request = false;
+    for (int i = 1; i < argc; ++i)
+    {
+        const std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help" || arg == "-V" || arg == "--version")
+        {
+            informational_request = true;
+            break;
+        }
+    }
+
+    try
+    {
+        parser.parse_args(argc, argv);
+    }
+    catch (const std::runtime_error &e)
+    {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
+
+    // The latest ArgumentsParser prints help/version and returns to the
+    // caller instead of terminating the process.
+    if (informational_request)
+        return 0;
 
     // Get parsed values
     std::string bam_file = parser.get<File>("bam");
@@ -176,6 +201,13 @@ int main(int argc, char *argv[])
 
         depth_stats = calculate_depth_stats(
             bam_file, bed_regions.get(), mapq_cut, n_threads);
+
+        if (!depth_stats.success)
+        {
+            std::cerr << "Error: Depth calculation failed: "
+                      << depth_stats.error_message << "\n";
+            return 1;
+        }
 
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time);
