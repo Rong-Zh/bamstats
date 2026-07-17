@@ -1,3 +1,4 @@
 [submodule "ArgumentsParser"]
 	path = ArgumentsParser
 	url = git@github.com:Rong-Zh/ArgumentsParser.git
+	branch = main
